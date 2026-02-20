@@ -13,6 +13,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <SparkFun_ADS122C04_ADC_Arduino_Library.h>
+#include <esp_wifi.h> 
 
 SFE_ADS122C04 mySensor;
 
@@ -20,6 +21,10 @@ SFE_ADS122C04 mySensor;
 // Receiver ESP32 MAC address
 uint8_t receiverMAC[] = {0xEC, 0x62, 0x60, 0x76, 0xB0, 0xD4};
 
+//CC:DB:A7:02:DF:BC
+//0xCC, 0xDB, 0xA7, 0x02, 0xDF, 0xBC
+
+//
 typedef struct __attribute__((packed)) {
   uint32_t timestamp_ms;
   int32_t ch1_raw;
@@ -62,13 +67,18 @@ void setup() {
   mySensor.setDataRate(ADS122C04_DATA_RATE_1000SPS);  // Maximum speed
   mySensor.setVoltageReference(ADS122C04_VREF_EXT_REF_PINS);
   mySensor.setConversionMode(ADS122C04_CONVERSION_MODE_CONTINUOUS);  // Continuous mode
-  mySensor.setOperatingMode(ADS122C04_OP_MODE_TURBO);  // Turbo mode
+  mySensor.setOperatingMode(ADS122C04_OP_MODE_TURBO);  // Turbo mode = ADS122C04_OP_MODE_TURBO  Normal mode = ADS122C04_OP_MODE_NORMAL 
   Serial.println("✓ ADC configured (2000 SPS, Turbo, Continuous)");
   
   /* ---- ESP-NOW Init ---- */
   WiFi.mode(WIFI_STA);
   Serial.print("✓ MAC Address: ");
   Serial.println(WiFi.macAddress());
+  esp_wifi_set_max_tx_power(8); // ~2 dBm — valid range is 8–84 (units of 0.25 dBm)
+  btStop(); // Turn off bluetooth
+
+  /* ---- ESP-Underclock Init ---- */
+  setCpuFrequencyMhz(160); // 80MHz = 3.5ms = 4.5Hrs = 120mA, 160 = 2ms = 3.9 Hrs = 140mA
   
   if (esp_now_init() != ESP_OK) {
     Serial.println("ERROR: ESP-NOW init failed!");
@@ -113,7 +123,7 @@ void loop() {
   /* ---- Channel 1: AIN3 - AIN2 ---- */
   mySensor.setInputMultiplexer(ADS122C04_MUX_AIN3_AIN2);
   mySensor.start();  // Trigger conversion in continuous mode
-  delay(1);  // Wait for conversion (1ms = safe for 2000 SPS)
+  //delayMicroseconds(20); // 0.5ms
   rawData = mySensor.readADC();
   signedData = (int32_t)rawData;
   if (signedData & 0x800000) signedData |= 0xFF000000;
@@ -123,7 +133,7 @@ void loop() {
   /* ---- Channel 2: AIN1 - AIN0 ---- */
   mySensor.setInputMultiplexer(ADS122C04_MUX_AIN1_AIN0);
   mySensor.start();  // Trigger conversion in continuous mode
-  delay(1);  // Wait for conversion (1ms = safe for 2000 SPS)
+  //delayMicroseconds(20); // 0.5ms
   rawData = mySensor.readADC();
   signedData = (int32_t)rawData;
   if (signedData & 0x800000) signedData |= 0xFF000000;
