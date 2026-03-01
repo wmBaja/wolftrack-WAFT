@@ -19,7 +19,7 @@ SFE_ADS122C04 mySensor;
 
 /* ================= ESP-NOW CONFIG ================= */
 // Receiver ESP32 MAC address
-uint8_t receiverMAC[] = {0xEC, 0x62, 0x60, 0x76, 0xB0, 0xD4};
+uint8_t receiverMAC[] = {0xEC, 0x62, 0x60, 0x77, 0xBB, 0x88};
 
 //CC:DB:A7:02:DF:BC
 //0xCC, 0xDB, 0xA7, 0x02, 0xDF, 0xBC
@@ -34,15 +34,23 @@ typedef struct __attribute__((packed)) {
 } adc_packet_t;
 
 adc_packet_t packet;
+volatile bool readyToSend = true;
 
 /* ================= ESP-NOW SEND STATUS ================= */
 void onSend(const wifi_tx_info_t *mac, esp_now_send_status_t status) {
   // Silent operation for speed - only uncomment for debugging
-  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+
+  readyToSend = true;
+
 }
 
 /* ================= SETUP ================= */
 void setup() {
+
+  /* ---- ESP-Underclock Init ---- */
+  setCpuFrequencyMhz(160); // 80MHz = 3.5ms = 4.5Hrs = 120mA, 160 = 2ms = 3.9 Hrs = 140mA
+
   Serial.begin(115200);
   delay(1000);
   Serial.println("=================================");
@@ -74,11 +82,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   Serial.print("✓ MAC Address: ");
   Serial.println(WiFi.macAddress());
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_max_tx_power(8); // ~2 dBm — valid range is 8–84 (units of 0.25 dBm)
   btStop(); // Turn off bluetooth
-
-  /* ---- ESP-Underclock Init ---- */
-  setCpuFrequencyMhz(160); // 80MHz = 3.5ms = 4.5Hrs = 120mA, 160 = 2ms = 3.9 Hrs = 140mA
   
   if (esp_now_init() != ESP_OK) {
     Serial.println("ERROR: ESP-NOW init failed!");
@@ -90,7 +96,7 @@ void setup() {
   
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, receiverMAC, 6);
-  peer.channel = 0;
+  peer.channel = 1;
   peer.encrypt = false;
   
   if (esp_now_add_peer(&peer) != ESP_OK) {
@@ -141,7 +147,10 @@ void loop() {
   packet.ch2_voltage = (signedData * 3.3) / 8388608.0;
   
   /* ---- ESP-NOW Send ---- */
-  esp_now_send(receiverMAC, (uint8_t *)&packet, sizeof(packet));
+  if (readyToSend) {
+    readyToSend = false;
+    Serial.println(esp_now_send(receiverMAC, (uint8_t *)&packet, sizeof(packet)));
+  }
   
   // No additional delay - run at maximum speed!
 }
