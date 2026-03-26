@@ -1,156 +1,294 @@
-/*
-  ADS122C04 Dual Differential Measurement - ESP32
-  ESP-NOW Sender (Optimized for Speed)
-  
-  Features:
-  - Continuous conversion mode
-  - Turbo mode (2000 SPS)
-  - Minimal serial output
-  - ~1-2ms loop time
-*/
-
+#include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <esp_now.h>
+#include <WiFiUdp.h>
 #include <SparkFun_ADS122C04_ADC_Arduino_Library.h>
-#include <esp_wifi.h> 
+#include <esp_bt.h>
+#include <esp_timer.h>
 
 SFE_ADS122C04 mySensor;
+WiFiUDP udp;
 
-/* ================= ESP-NOW CONFIG ================= */
-// Receiver ESP32 MAC address
-uint8_t receiverMAC[] = {0xEC, 0x62, 0x60, 0x77, 0xBB, 0x88};
+namespace {
 
-//CC:DB:A7:02:DF:BC
-//0xCC, 0xDB, 0xA7, 0x02, 0xDF, 0xBC
+constexpr char kWifiSsid[] = "WAFTLink";
+constexpr char kWifiPassword[] = "waftlink123";
+constexpr uint8_t kWifiChannel = 6;
+const IPAddress kReceiverIp(192, 168, 4, 1);
+constexpr uint16_t kUdpPort = 3333;
 
-//
-typedef struct __attribute__((packed)) {
-  uint32_t timestamp_ms;
+constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kBatchSamples = 50;
+constexpr uint16_t kMaxSamplesPerPacket = 145;
+constexpr uint16_t kMaxUdpPayloadBytes = 1460;
+
+constexpr uint32_t kSamplePeriodUs = 4000;
+constexpr uint32_t kConversionTimeoutUs = 2000;
+constexpr uint32_t kWifiRetryIntervalMs = 2000;
+constexpr uint32_t kStatsIntervalMs = 5000;
+constexpr float kAdcReferenceVolts = 3.3f;
+constexpr uint32_t kI2cClockHz = 400000;
+
+struct __attribute__((packed)) BatchHeader {
+  uint8_t version;
+  uint8_t sample_count;
+  uint16_t flags;
+  uint32_t sequence;
+};
+
+struct __attribute__((packed)) SampleRecord {
+  uint16_t dt_ms;
   int32_t ch1_raw;
   int32_t ch2_raw;
-  float ch1_voltage;
-  float ch2_voltage;
-} adc_packet_t;
+};
 
-adc_packet_t packet;
-volatile bool readyToSend = true;
+struct __attribute__((packed)) SampleBatch {
+  BatchHeader header;
+  SampleRecord samples[kBatchSamples];
+};
 
-/* ================= ESP-NOW SEND STATUS ================= */
-void onSend(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Silent operation for speed - only uncomment for debugging
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+static_assert(sizeof(BatchHeader) + (sizeof(SampleRecord) * kBatchSamples) <= kMaxUdpPayloadBytes,
+              "Configured batch exceeds UDP payload budget");
+static_assert(kBatchSamples <= kMaxSamplesPerPacket,
+              "Configured batch exceeds supported sample count");
 
-  readyToSend = true;
+SampleBatch batch = {};
+uint8_t batchCount = 0;
+uint32_t nextSequence = 0;
+uint64_t batchStartUs = 0;
+uint64_t nextFrameUs = 0;
 
+uint32_t sentBatches = 0;
+uint32_t droppedBatches = 0;
+uint32_t adcTimeouts = 0;
+uint32_t lateFrameRecoveries = 0;
+uint32_t lastWifiAttemptMs = 0;
+uint32_t lastStatsMs = 0;
+bool wifiWasConnected = false;
+
+int32_t signExtend24(uint32_t rawValue) {
+  int32_t signedValue = static_cast<int32_t>(rawValue & 0x00FFFFFFUL);
+  if ((signedValue & 0x00800000L) != 0) {
+    signedValue |= static_cast<int32_t>(0xFF000000UL);
+  }
+  return signedValue;
 }
 
-/* ================= SETUP ================= */
-void setup() {
+float rawToVoltage(int32_t rawValue) {
+  return (static_cast<float>(rawValue) * kAdcReferenceVolts) / 8388608.0f;
+}
 
-  /* ---- ESP-Underclock Init ---- */
-  setCpuFrequencyMhz(160); // 80MHz = 3.5ms = 4.5Hrs = 120mA, 160 = 2ms = 3.9 Hrs = 140mA
+bool waitForDataReady(uint32_t timeoutUs) {
+  const uint64_t deadlineUs = esp_timer_get_time() + timeoutUs;
+  while (esp_timer_get_time() < deadlineUs) {
+    if (mySensor.checkDataReady()) {
+      return true;
+    }
+    delayMicroseconds(50);
+  }
+  return mySensor.checkDataReady();
+}
 
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("=================================");
-  Serial.println("ADS122C04 ESP-NOW Sender");
-  Serial.println("Optimized for Maximum Speed");
-  Serial.println("=================================");
-  
-  /* ---- I2C Init ---- */
-  Wire.begin();
-  Wire.setClock(400000);  // Use 400kHz I2C for faster communication
-  
+bool readChannel(uint8_t muxConfig, int32_t &rawOut) {
+  if (!mySensor.setInputMultiplexer(muxConfig)) {
+    return false;
+  }
+  if (!mySensor.start()) {
+    return false;
+  }
+  if (!waitForDataReady(kConversionTimeoutUs)) {
+    return false;
+  }
+
+  rawOut = signExtend24(mySensor.readADC());
+  return true;
+}
+
+void beginWifiConnection() {
+  WiFi.begin(kWifiSsid, kWifiPassword, kWifiChannel);
+  WiFi.setTxPower(WIFI_POWER_2dBm);
+  lastWifiAttemptMs = millis();
+}
+
+void maintainWifiConnection() {
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print("WiFi connected, IP=");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WiFi disconnected");
+  }
+
+  const uint32_t nowMs = millis();
+  if ((nowMs - lastWifiAttemptMs) >= kWifiRetryIntervalMs) {
+    Serial.println("Retrying WiFi connection...");
+    beginWifiConnection();
+  }
+}
+
+void flushBatch() {
+  if (batchCount == 0) {
+    return;
+  }
+
+  batch.header.version = kProtocolVersion;
+  batch.header.sample_count = batchCount;
+  batch.header.flags = 0;
+  batch.header.sequence = nextSequence++;
+
+  const size_t packetSize = sizeof(BatchHeader) + (static_cast<size_t>(batchCount) * sizeof(SampleRecord));
+  bool sent = false;
+
+  if (WiFi.status() == WL_CONNECTED && udp.beginPacket(kReceiverIp, kUdpPort)) {
+    const size_t written = udp.write(reinterpret_cast<const uint8_t *>(&batch), packetSize);
+    sent = (written == packetSize) && (udp.endPacket() == 1);
+  }
+
+  if (sent) {
+    sentBatches++;
+  } else {
+    droppedBatches++;
+  }
+
+  batchCount = 0;
+  batchStartUs = 0;
+}
+
+bool captureSampleFrame() {
+  int32_t ch1Raw = 0;
+  int32_t ch2Raw = 0;
+
+  const uint64_t frameStartUs = esp_timer_get_time();
+
+  if (!readChannel(ADS122C04_MUX_AIN3_AIN2, ch1Raw) ||
+      !readChannel(ADS122C04_MUX_AIN1_AIN0, ch2Raw)) {
+    adcTimeouts++;
+    return false;
+  }
+
+  if (batchCount == 0) {
+    batchStartUs = frameStartUs;
+  }
+
+  SampleRecord &sample = batch.samples[batchCount];
+  sample.dt_ms = static_cast<uint16_t>(((frameStartUs - batchStartUs) + 500ULL) / 1000ULL);
+  sample.ch1_raw = ch1Raw;
+  sample.ch2_raw = ch2Raw;
+
+  batchCount++;
+  if (batchCount >= kBatchSamples) {
+    flushBatch();
+  }
+
+  return true;
+}
+
+void printStats() {
+  const uint32_t nowMs = millis();
+  if ((nowMs - lastStatsMs) < kStatsIntervalMs) {
+    return;
+  }
+  lastStatsMs = nowMs;
+
+  Serial.print("Batches sent=");
+  Serial.print(sentBatches);
+  Serial.print(" dropped=");
+  Serial.print(droppedBatches);
+  Serial.print(" adc_timeouts=");
+  Serial.print(adcTimeouts);
+  Serial.print(" late_recoveries=");
+  Serial.print(lateFrameRecoveries);
+  Serial.print(" wifi=");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "up" : "down");
+
+  if (batchCount > 0) {
+    const SampleRecord &lastSample = batch.samples[batchCount - 1];
+    Serial.print(" pending=");
+    Serial.print(batchCount);
+    Serial.print(" last_dt=");
+    Serial.print(lastSample.dt_ms);
+    Serial.print("ms ch1=");
+    Serial.print(rawToVoltage(lastSample.ch1_raw), 4);
+    Serial.print("V ch2=");
+    Serial.print(rawToVoltage(lastSample.ch2_raw), 4);
+    Serial.print("V");
+  }
+
+  Serial.println();
+}
+
+void configureSensor() {
   if (!mySensor.begin(0x40)) {
     Serial.println("ERROR: ADS122C04 not detected!");
     Serial.println("Check wiring and I2C address.");
-    while (1);
+    while (true) {
+      delay(1000);
+    }
   }
-  Serial.println("✓ ADS122C04 detected");
-  
-  /* ---- ADC Configuration ---- */
+
   mySensor.configureADCmode(ADS122C04_RAW_MODE);
   mySensor.setGain(ADS122C04_GAIN_1);
-  mySensor.setDataRate(ADS122C04_DATA_RATE_1000SPS);  // Maximum speed
+  mySensor.setDataRate(ADS122C04_DATA_RATE_1000SPS);
   mySensor.setVoltageReference(ADS122C04_VREF_EXT_REF_PINS);
-  mySensor.setConversionMode(ADS122C04_CONVERSION_MODE_CONTINUOUS);  // Continuous mode
-  mySensor.setOperatingMode(ADS122C04_OP_MODE_TURBO);  // Turbo mode = ADS122C04_OP_MODE_TURBO  Normal mode = ADS122C04_OP_MODE_NORMAL 
-  Serial.println("✓ ADC configured (2000 SPS, Turbo, Continuous)");
-  
-  /* ---- ESP-NOW Init ---- */
-  WiFi.mode(WIFI_STA);
-  Serial.print("✓ MAC Address: ");
-  Serial.println(WiFi.macAddress());
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_max_tx_power(8); // ~2 dBm — valid range is 8–84 (units of 0.25 dBm)
-  btStop(); // Turn off bluetooth
-  
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ERROR: ESP-NOW init failed!");
-    while (1);
-  }
-  Serial.println("✓ ESP-NOW initialized");
-  
-  esp_now_register_send_cb(onSend);
-  
-  esp_now_peer_info_t peer{};
-  memcpy(peer.peer_addr, receiverMAC, 6);
-  peer.channel = 1;
-  peer.encrypt = false;
-  
-  if (esp_now_add_peer(&peer) != ESP_OK) {
-    Serial.println("ERROR: Failed to add peer!");
-    while (1);
-  }
-  
-  Serial.print("✓ Peer added: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", receiverMAC[i]);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
-  
-  Serial.println("=================================");
-  Serial.println("Starting data transmission...");
-  Serial.println("(Serial output disabled for speed)");
-  Serial.println("=================================\n");
-  
-  delay(1000);
+  mySensor.setConversionMode(ADS122C04_CONVERSION_MODE_SINGLE_SHOT);
+  mySensor.setOperatingMode(ADS122C04_OP_MODE_TURBO);
 }
 
-/* ================= MAIN LOOP ================= */
+}  // namespace
+
+void setup() {
+  setCpuFrequencyMhz(160);
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("=================================");
+  Serial.println("WAFT UDP Sender");
+  Serial.println("250 SPS batched WiFi transport");
+  Serial.println("=================================");
+
+  Wire.begin();
+  Wire.setClock(kI2cClockHz);
+  configureSensor();
+
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  beginWifiConnection();
+
+  Serial.println("ADC configured: 1000 SPS, turbo, single-shot");
+  Serial.println("WiFi connecting to WAFTLink...");
+  nextFrameUs = esp_timer_get_time();
+}
+
 void loop() {
-  uint32_t rawData;
-  int32_t signedData;
-  
-  packet.timestamp_ms = millis();
-  
-  /* ---- Channel 1: AIN3 - AIN2 ---- */
-  mySensor.setInputMultiplexer(ADS122C04_MUX_AIN3_AIN2);
-  mySensor.start();  // Trigger conversion in continuous mode
-  //delayMicroseconds(20); // 0.5ms
-  rawData = mySensor.readADC();
-  signedData = (int32_t)rawData;
-  if (signedData & 0x800000) signedData |= 0xFF000000;
-  packet.ch1_raw = signedData;
-  packet.ch1_voltage = (signedData * 3.3) / 8388608.0;
-  
-  /* ---- Channel 2: AIN1 - AIN0 ---- */
-  mySensor.setInputMultiplexer(ADS122C04_MUX_AIN1_AIN0);
-  mySensor.start();  // Trigger conversion in continuous mode
-  //delayMicroseconds(20); // 0.5ms
-  rawData = mySensor.readADC();
-  signedData = (int32_t)rawData;
-  if (signedData & 0x800000) signedData |= 0xFF000000;
-  packet.ch2_raw = signedData;
-  packet.ch2_voltage = (signedData * 3.3) / 8388608.0;
-  
-  /* ---- ESP-NOW Send ---- */
-  if (readyToSend) {
-    readyToSend = false;
-    Serial.println(esp_now_send(receiverMAC, (uint8_t *)&packet, sizeof(packet)));
+  maintainWifiConnection();
+  printStats();
+
+  const uint64_t nowUs = esp_timer_get_time();
+  if (nowUs < nextFrameUs) {
+    if ((nextFrameUs - nowUs) > 200U) {
+      delayMicroseconds(100);
+    }
+    return;
   }
-  
-  // No additional delay - run at maximum speed!
+
+  if ((nowUs - nextFrameUs) > kSamplePeriodUs) {
+    const uint64_t skippedFrames = (nowUs - nextFrameUs) / kSamplePeriodUs;
+    lateFrameRecoveries += static_cast<uint32_t>(skippedFrames);
+    nextFrameUs += skippedFrames * static_cast<uint64_t>(kSamplePeriodUs);
+  }
+
+  nextFrameUs += kSamplePeriodUs;
+  captureSampleFrame();
 }
